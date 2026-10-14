@@ -1,0 +1,27 @@
+# Patient data and generated artifacts: NEVER commit
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.db
+*.sqlite*
+*.log
+*.tmp
+*.bak
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+selectors.json
+*credentials*
+*secret*
+*token*
