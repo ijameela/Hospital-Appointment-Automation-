@@ -1,0 +1,15 @@
+{
+  "approved_host": "REPLACE_WITH_AUTHORIZED_HOST",
+  "login_url": "https://REPLACE_WITH_AUTHORIZED_HOST/",
+  "selectors": {
+    "patient_search": null,
+    "patient_search_button": null,
+    "selected_patient_id": null,
+    "appointment_date": null,
+    "start_time": null,
+    "end_time": null,
+    "visit_type": null,
+    "save_button": null,
+    "save_message": null
+  }
+}
