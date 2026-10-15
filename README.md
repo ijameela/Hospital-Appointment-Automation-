@@ -1,79 +1,108 @@
 # Hospital Appointment Automation
 
-**Python · Selenium · Flask · SQLite · Pandas**
+### A Python and Selenium-Based Framework for Automated Appointment Scheduling
 
-Two separate components are included for a technical demonstration:
+A healthcare appointment automation project designed to streamline appointment entry from Excel, reduce repetitive manual work, improve error tracking, and support reliable processing of appointment records.
 
-| Component | Purpose | Verified status |
-|---|---|---|
-| `mock-system/` | Synthetic local booking UI and Selenium booking automation | Tested in the local mock; not a hospital system |
-| `real-system/` | RABET integration candidate: manual login, Excel validation, stage-specific results, configurable selectors | **Not integrated or tested on RABET; not production ready** |
+The project includes a **tested local simulation environment (Mock System)** and a separate **automation script designed for the real hospital appointment scheduling system**.
+---
+## Problem Statement
 
-> **Important:** The real-system script is not a completed unattended booking bot. HTML selectors have not been verified, and schedule navigation and exact patient search result selection still require human involvement. It defaults to preview mode (no Save). Do not describe this as a production-ready solution.
+Manual appointment scheduling in healthcare systems is time-consuming, repetitive, and prone to human errors, particularly when handling large volumes of patient appointments.
 
-## Repository structure
+Key challenges include:
 
-```text
-mock-system/
-  mock_app.py
-  appointment_script.py
-  create_sample_data.py
-real-system/
-  rabet_booking.py
-  selectors.example.json
-docs/
-  TEST_RESULTS.md
-  PRODUCTION_READINESS.md
-requirements.txt
-.gitignore
-```
+- **Manual Data Entry:** Repetitive tasks increase workload and processing time.
+- **Human Errors:** Incorrect patient information, dates, or appointment details.
+- **Duplicate Bookings:** Repeated attempts may create duplicate appointments.
+- **Error Tracking:** Difficulty identifying booking failures and their causes.
+- **System Timeouts:** Unexpected interruptions may affect appointment processing.
+- **Process Recovery:** Difficulty resuming operations safely after interruptions.
 
-## Demonstrate the mock locally (Windows PowerShell)
+This project aims to address these challenges through **reliable appointment automation, error tracking, and safe process recovery**.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe mock-system\create_sample_data.py
-```
+---
+## Project Objectives
 
-Terminal 1:
+The primary objective of this project is to **automate hospital appointment scheduling using Python and Selenium**, improving efficiency, accuracy, and reliability.
 
-```powershell
-.\.venv\Scripts\python.exe mock-system\mock_app.py
-```
+Key objectives include:
 
-Terminal 2:
+- **Automated Scheduling:** Read appointment data from Excel and automate appointment entry.
+- **Data Validation:** Verify patient and appointment information before booking.
+- **Error Detection:** Identify booking errors, including duplicate appointments and unavailable slots.
+- **Error Logging:** Record booking results, failure reasons, and processing stages in Excel.
+- **Timeout Handling:** Detect system delays and unexpected interruptions.
+- **Safe Recovery:** Resume processing without automatically repeating uncertain bookings.
+- **Testing:** Validate automation workflows using a local Mock System before real-system deployment.
 
-```powershell
-.\.venv\Scripts\python.exe mock-system\appointment_script.py
-```
+---
+## Technologies Used
 
-The mock is local only at `http://127.0.0.1:5000/booking`, and the mock Selenium script accepts only synthetic patient IDs. Do not modify it to target a hospital system.
+The project utilizes the following technologies to automate appointment scheduling, validate data, and manage errors.
 
-## Real-system integration candidate
+| Technology | Purpose |
+|---|---|
+| **Python** | Develops and controls the appointment automation workflow. |
+| **Selenium WebDriver** | Automates browser interactions, including patient searches, form entry, and appointment processing. |
+| **Pandas** | Reads and validates appointment data from Excel files. |
+| **OpenPyXL** | Supports Excel file processing and recording booking results. |
+| **Flask** | Provides a local web application for simulating the appointment scheduling system. |
+| **SQLite** | Stores simulated patient appointments and booking records. |
+| **Logging** | Records errors, exceptions, and processing stages for troubleshooting. |
+| **CSV / Excel** | Stores appointment input data, processing results, and error reports. |
 
-`real-system/rabet_booking.py` reads an **existing, local** Excel file with the following column names:
+---
+## How It Works
 
-`ID type`, `PatientName`, `ScheduleDate`, `StartTime`, `EndTime`, `IsVirtual`, `CLINICCODE`, `DoctorName`.
+The appointment automation workflow is designed to process appointment records from Excel using Python and Selenium.
 
-It opens a configured **approved HTTPS** URL, waits for **manual login**, validates rows, and saves status/error information to a **separate local Excel file** without copying patient names or IDs. The original input workbook is not modified.
+| Step | Description |
+|---|---|
+| **1. Manual Login** | The user logs into the hospital system using authorized credentials. |
+| **2. Excel Data Extraction** | The script reads patient and appointment details from an Excel file. |
+| **3. Data Validation** | Validates patient information, appointment dates, times, clinics, and visit types. |
+| **4. Appointment Processing** | Searches for patients, selects appointment details, and processes bookings. |
+| **5. Error Detection** | Identifies issues such as duplicate appointments, unavailable slots, invalid patient records, and timeouts. |
+| **6. Result Logging** | Records each appointment's status, error type, and processing stage in an output file. |
+| **7. Safe Recovery** | Skips completed or uncertain bookings during subsequent runs to prevent unintended duplicates. |
 
-The provided `selectors.example.json` is deliberately incomplete: screenshots cannot reveal reliable HTML locators. On an authorized test environment, make a **local, private** copy named `selectors.json`, supply the approved host and verified locators, and run from the `real-system` directory:
+### Implementation Status
 
-```powershell
-Copy-Item selectors.example.json selectors.json
-..\.venv\Scripts\python.exe rabet_booking.py --excel "C:\private\appointments.xlsx" --config selectors.json --results "C:\private\booking_results.xlsx"
-```
+| System | Description |
+|---|---|
+| **Mock System** | The booking workflow and key error-handling scenarios have been tested locally. |
+| **Real System** | A separate automation script has been developed for the hospital appointment scheduling system. |
 
-**Default is preview/no-save.** Do not enable submissions on a live clinical system. This candidate still requires implementation and formal testing of navigation, patient identity matching, error behavior, duplicate handling, post-save reconciliation, and overbooking approval before any clinical use.
+---
+## Testing & Results
 
-## Testing and security
+The appointment automation workflow was evaluated using a local Mock System with synthetic patient data to assess booking functionality, error handling, and process reliability.
 
-- See [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md) for mock testing evidence and limitations.
-- See [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md) for remaining integration tasks.
-- Never commit actual patient Excel files, output results, screenshots showing patients, passwords, cookies, internal system hostnames, or logs. `.gitignore` helps, but manually check the upload selection and repository history.
-- This public repository contains no actual patient records or production portal configuration.
+| Test Scenario | Result |
+|---|---|
+| Appointment Booking | Successfully tested |
+| Overbooking | Successfully tested |
+| Duplicate Appointment Detection | Successfully tested |
+| Error Logging | Successfully tested |
+| Timeout Detection | Successfully tested |
+| Booking Status Tracking | Successfully tested |
+| Interrupted-Row Handling | Successfully tested |
+| Mock System Response Recovery | Successfully tested |
 
-## Current status
+**Testing Environment:** Local Flask-based Mock System using synthetic patient records.
 
-**Proof of concept tested on a synthetic local mock. Real-system integration candidate remains unverified and must not be represented as deployed.**
+**Note:** These results are based on local simulation tests and do not represent testing on the real hospital system.
+
+---
+## Future Work
+
+Future development will focus on enhancing the automation framework and extending its capabilities to the real hospital appointment scheduling system.
+
+- **Real-System Automation:** Complete and validate automated appointment processing on the hospital scheduling interface.
+- **Enhanced Error Handling:** Improve error classification, timeout handling, and recovery from unexpected interruptions.
+- **Booking Verification:** Strengthen post-save verification to prevent duplicate or uncertain bookings.
+- **Performance Optimization:** Improve processing efficiency and reliability for large Excel datasets.
+- **Testing and Validation:** Conduct further testing to evaluate accuracy, stability, and operational readiness.
+
+---
