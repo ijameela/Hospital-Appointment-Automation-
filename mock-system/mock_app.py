@@ -1,5 +1,5 @@
+
 """Local-only synthetic appointment booking UI. No connection to hospital systems."""
-import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +16,7 @@ PATIENTS = {
     '9000000004': {'name': 'TEST PATIENT FOUR', 'mobile': '0500000004', 'state': 'suspended'},
     '9000000005': {'name': 'TEST PATIENT FIVE', 'mobile': '0500000', 'state': 'active'},
     '9000000006': {'name': 'TEST PATIENT SIX', 'mobile': '0500000006', 'state': 'active'},
+    '9000000007': {'name': 'TEST PATIENT', 'mobile': '0500000007', 'state': 'active'},
 }
 CLINICS = {'OPT1': 'OPTOMETRY CLINIC', 'NS04': 'NEUROLOGY CLINIC', 'SUBNS04': 'VIRTUAL NEUROLOGY CLINIC'}
 VISIT_TYPES = ['Followup Visit','ER Visit','Investigation Visit','Dental Visit','Refill Visit','TeleConsult','Well Baby Visit']
@@ -23,6 +24,7 @@ VISIT_TYPES = ['Followup Visit','ER Visit','Investigation Visit','Dental Visit',
 def connect():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
+    con.execute('PRAGMA busy_timeout=5000')
     return con
 
 def init_db():
@@ -50,10 +52,20 @@ async function json(url,options){let r=await fetch(url,options);return await r.j
 async function lookup(){let id=el('national_id').value.trim();el('patient_name').value='';el('mobile').value='';el('patient_message').textContent='';if(!id)return;let x=await json('/api/patient/'+encodeURIComponent(id));if(x.ok){el('patient_name').value=x.patient.name;el('mobile').value=x.patient.mobile;if(x.patient.state!=='active')el('patient_message').textContent='Patient File '+x.patient.state;}else el('patient_message').textContent=x.error;}
 async function slots(){slotApproved=false;el('overbook').style.display='none';let o=vals();let u=new URLSearchParams({clinic_code:o.clinic_code,appointment_date:o.appointment_date,start_time:o.start_time,doctor_name:o.doctor_name});let x=await json('/api/slot?'+u);el('slot_message').textContent=x.message;if(x.count>=1 && x.count<3 && x.ok){el('overbook').style.display='inline-block'}else if(x.count===0 && x.ok)slotApproved=true;return x;}
 async function bookings(){let x=await json('/api/bookings');el('bookings').innerHTML=x.bookings.map(b=>'<tr>'+[b.patient_name,b.clinic_code,b.appointment_date,b.start_time,b.doctor_name,b.visit_type,'Booked'].map(v=>'<td>'+String(v).replaceAll('&','&amp;').replaceAll('<','&lt;')+'</td>').join('')+'</tr>').join('');}
-el('national_id').addEventListener('change',lookup);for(let id of ['clinic_code','appointment_date','start_time','doctor_name'])el(id).addEventListener('change',()=>{slotApproved=false;el('overbook').style.display='none';el('slot_message').textContent='';});
+el('national_id').addEventListener('change',lookup);for(let id of ['clinic_code','appointment_date','start_time','end_time','doctor_name','national_id','visit_type'])el(id).addEventListener('change',()=>{slotApproved=false;el('overbook').style.display='none';el('slot_message').textContent='';});
 el('check_slot').onclick=slots;el('overbook').onclick=()=>{slotApproved=true;el('slot_message').textContent='Overbooking approved for this slot (maximum 3)';};
 el('notice_ok').onclick=()=>{el('notice').style.display='none';};el('refresh').onclick=bookings;
-el('save').onclick=async()=>{el('result').textContent='';let o=vals();o.overbooking=slotApproved;let x=await json('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});el('result').textContent=x.ok?'Successfully Saved — '+x.booking_id:x.error;el('result').className=x.ok?'ok':'error';if(x.ok){slotApproved=false;await bookings();}};
+el('save').onclick=async()=>{
+  const btn=el('save');if(btn.disabled)return;btn.disabled=true;
+  el('result').textContent='';let o=vals();o.overbooking=slotApproved;
+  try {
+    let x=await json('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+    el('result').textContent=x.ok?'Successfully Saved — '+x.booking_id:x.error;
+    el('result').className=x.ok?'ok':'error';
+    if(x.ok){slotApproved=false;el('overbook').style.display='none';await bookings();}
+  }catch(e){el('result').textContent='Request failed — verify booking status before retrying';el('result').className='error';}
+  finally{btn.disabled=false;}
+};
 bookings();
 </script></body></html>'''
 
@@ -100,17 +112,22 @@ def save():
     if patient['state']=='closed': return fail('Patient File Closed')
     if patient['state']=='suspended': return fail('Patient File Suspended')
     if patient['name'].casefold()!=str(d['patient_name']).strip().casefold(): return fail('Patient Name Mismatch')
+    if len(patient['name'].split()) < 3: return fail('No Third Name')
     if len(patient['mobile'])!=10: return fail('Incomplete Mobile Number')
     if d['clinic_code'] not in CLINICS: return fail('Schedule Not Generated')
+    if not str(d['doctor_name']).strip(): return fail('Schedule Not Generated')
     if d['visit_type'] not in VISIT_TYPES: return fail('Invalid Visit Type')
     try:
         day=datetime.strptime(d['appointment_date'],'%Y-%m-%d')
         start=datetime.strptime(d['start_time'],'%H:%M')
         end=datetime.strptime(d['end_time'],'%H:%M')
         if end<=start: return fail('Invalid Time Range')
-    except ValueError: return fail('Invalid Date or Time')
-    source_key='|'.join(str(d[k]).strip() for k in ['national_id','clinic_code','doctor_name','appointment_date','start_time','end_time'])
+    except (ValueError, TypeError): return fail('Invalid Date or Time')
+    d={k:(v.strip() if isinstance(v,str) else v) for k,v in d.items()}
+    source_key='|'.join(str(d[k]) for k in ['national_id','clinic_code','doctor_name','appointment_date','start_time','end_time'])
     with connect() as con:
+        # Serialize validation and insertion to enforce the capacity limit under concurrency.
+        con.execute('BEGIN IMMEDIATE')
         existing=con.execute('SELECT id FROM appointments WHERE source_key=?', (source_key,)).fetchone()
         if existing: return fail('Appointment Already Exists',409)
         same_patient=con.execute('SELECT id FROM appointments WHERE national_id=? AND appointment_date=? AND start_time=?',
@@ -119,7 +136,7 @@ def save():
         count=con.execute('SELECT COUNT(*) FROM appointments WHERE clinic_code=? AND appointment_date=? AND start_time=? AND doctor_name=?',
             (d['clinic_code'],d['appointment_date'],d['start_time'],d['doctor_name'])).fetchone()[0]
         if count>=3: return fail('No available slot',409)
-        if count>=1 and not d.get('overbooking'): return fail('Overbooking Required',409)
+        if count>=1 and d.get('overbooking') is not True: return fail('Overbooking Required',409)
         cur=con.execute('''INSERT INTO appointments(source_key,national_id,patient_name,clinic_code,doctor_name,appointment_date,start_time,end_time,visit_type,created_at)
           VALUES(?,?,?,?,?,?,?,?,?,?)''', (source_key,d['national_id'],patient['name'],d['clinic_code'],d['doctor_name'],d['appointment_date'],d['start_time'],d['end_time'],d['visit_type'],datetime.now().isoformat()))
         return jsonify(ok=True,booking_id=cur.lastrowid)
