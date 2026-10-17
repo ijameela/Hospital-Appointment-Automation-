@@ -1,27 +1,35 @@
-# Patient data and generated artifacts: NEVER commit
-*.xlsx
-*.xls
-*.xlsm
-*.csv
-*.db
-*.sqlite*
-*.log
-*.tmp
-*.bak
-*.pdf
-*.png
-*.jpg
-*.jpeg
-*.webp
-.env
-.env.*
+
+# Python virtual environments
 .venv/
 venv/
+
+# Python cache
 __pycache__/
 *.py[cod]
-.vscode/
-.idea/
-selectors.json
+
+# Excel files
+*.xlsx
+*.xls
+
+# Generated results and logs
+*.csv
+*.log
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
 *credentials*
-*secret*
-*token*
+*secrets*
+*cookies*
+*session*
+
+# Editor and system files
+.vscode/
+.DS_Store
+Thumbs.db
