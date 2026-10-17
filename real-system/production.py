@@ -1,7 +1,6 @@
 """RABET appointment automation: manual login and Excel-driven booking.
 
 Developed by Jameelah Algethami.
-Configure production with verified page locators before execution.
 The script does not contain usernames, passwords, or patient records.
 """
 
