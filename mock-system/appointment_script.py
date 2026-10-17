@@ -7,232 +7,271 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime, time as dt_time
+from datetime import datetime, date, time as dt_time
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 from urllib.request import urlopen
 
 import pandas as pd
+from openpyxl import load_workbook
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
-ROOT = Path(__file__).resolve().parent
-INPUT = ROOT / "patients_appointments.xlsx"
-STATUS = ROOT / "booking_results.csv"
-LOG = ROOT / "appointment_errors.log"
-URL = "http://127.0.0.1:5000/booking"
-WAIT_SECONDS = 12
 
-FIELDS = [
+BASE = Path(__file__).resolve().parent
+EXCEL = BASE / "patients_appointments.xlsx"
+RESULTS = BASE / "booking_results.csv"
+ERRORS = BASE / "appointment_errors.log"
+
+URL = "http://127.0.0.1:5000"
+WAIT = 30
+
+INPUT_COLUMNS = [
+    "ID type", "PatientName", "ScheduleDate", "StartTime",
+    "EndTime", "IsVirtual", "CLINICCODE", "DoctorName"
+]
+
+OUTPUT_COLUMNS = [
     "Excel_Row", "Row_Fingerprint", "Booking_Status",
     "Stage", "Details", "Updated_At"
 ]
 
-REQUIRED_COLUMNS = [
-    "ID type", "PatientName", "ScheduleDate",
-    "StartTime", "EndTime", "IsVirtual",
-    "CLINICCODE", "DoctorName"
-]
-
 KNOWN_ERRORS = {
+    "No records found",
     "Patient Not Found",
     "Patient File Closed",
-    "Patient File Suspended",
-    "Patient Name Mismatch",
+    "This patient file is suspended",
     "Incomplete Mobile Number",
     "No Third Name",
     "Appointment Already Exists",
     "No available slot",
-    "No Slot",
-    "Overbooking Required",
     "Schedule Not Generated",
+    "Patient Name Mismatch",
+    "Overbooking Required",
     "Invalid Visit Type",
     "Invalid Date or Time",
     "Invalid Time Range",
     "Required Fields Missing"
 }
 
-SKIP_STATUSES = {
-    "Successfully Saved",
+REVIEW_STATUSES = {
     "Save Status Uncertain",
-    "Appointment Already Exists",
-    "In Progress - Review Before Retry",
-    "Review Required - Input Changed"
+    "Review Required",
+    "In Progress"
 }
 
 logging.basicConfig(
-    filename=LOG,
+    filename=ERRORS,
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     encoding="utf-8"
 )
 
 
-class BookingStageError(Exception):
+class BookingError(Exception):
     def __init__(self, stage, message):
-        super().__init__(message)
         self.stage = stage
+        super().__init__(message)
 
 
-def as_text(value):
-    return "" if pd.isna(value) else str(value).strip()
+def clean(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
-def synthetic_id(value):
-    value = as_text(value)
-
-    if value.endswith(".0"):
-        value = value[:-2]
-
-    if not re.fullmatch(r"900000000[1-7]", value):
-        raise ValueError(
-            "Test environment only: synthetic IDs "
-            "9000000001–9000000007"
-        )
-
-    return value
-
-
-def date_text(value):
-    if isinstance(value, (datetime, pd.Timestamp, date)):
+def normalize_date(value):
+    if isinstance(value, (datetime, date, pd.Timestamp)):
         return value.strftime("%Y-%m-%d")
 
-    value = as_text(value)
+    value = clean(value)
 
-    for fmt in (
-        "%Y-%m-%d",
-        "%d/%m/%Y",
-        "%d-%m-%Y",
-        "%d.%m.%Y",
-        "%Y-%m-%d %H:%M:%S",
-        "%d/%m/%Y %H:%M:%S"
-    ):
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
         try:
             return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
         except ValueError:
-            continue
+            pass
 
-    raise ValueError("Invalid ScheduleDate")
+    raise BookingError("EXCEL", "Invalid Date or Time")
 
 
-def time_text(value):
-    if isinstance(value, (datetime, pd.Timestamp, dt_time)):
+def normalize_time(value):
+    if isinstance(value, (datetime, dt_time, pd.Timestamp)):
         return value.strftime("%H:%M")
 
-    value = as_text(value)
+    value = clean(value)
 
-    for fmt in (
-        "%H:%M",
-        "%H:%M:%S",
-        "%I:%M %p",
-        "%I:%M:%S %p"
-    ):
+    for fmt in ("%H:%M", "%H:%M:%S"):
         try:
             return datetime.strptime(value, fmt).strftime("%H:%M")
         except ValueError:
-            continue
+            pass
 
-    raise ValueError("Invalid Time")
-
-
-def visit_type(value):
-    value = as_text(value).lower()
-
-    if value in ("0", "0.0"):
-        return "Followup Visit"
-
-    if value in ("1", "1.0"):
-        return "TeleConsult"
-
-    raise ValueError("Invalid IsVirtual: expected 0 or 1")
+    raise BookingError("EXCEL", "Invalid Date or Time")
 
 
-def load_rows():
-    if not INPUT.exists():
-        raise FileNotFoundError(
-            "Put patients_appointments.xlsx in the mock-system folder"
+def prepare(row):
+    national_id = clean(row["ID type"]).removesuffix(".0")
+
+    if not re.fullmatch(r"900000000[1-7]", national_id):
+        raise BookingError(
+            "EXCEL",
+            "Only synthetic patient IDs are permitted"
         )
 
-    df = pd.read_excel(
-        INPUT,
-        dtype=str,
-        keep_default_na=False
-    )
+    is_virtual = clean(row["IsVirtual"])
 
-    missing = [
-        column for column in REQUIRED_COLUMNS
-        if column not in df.columns
-    ]
+    if is_virtual in ("0", "0.0"):
+        visit_type = "Followup Visit"
+    elif is_virtual in ("1", "1.0"):
+        visit_type = "TeleConsult"
+    else:
+        raise BookingError("EXCEL", "Invalid Visit Type")
 
-    if missing:
-        raise ValueError(
-            "Missing columns: " + ", ".join(missing)
-        )
+    data = {
+        "national_id": national_id,
+        "patient_name": clean(row["PatientName"]),
+        "appointment_date": normalize_date(row["ScheduleDate"]),
+        "start_time": normalize_time(row["StartTime"]),
+        "end_time": normalize_time(row["EndTime"]),
+        "clinic_code": clean(row["CLINICCODE"]).upper(),
+        "doctor_name": clean(row["DoctorName"]),
+        "visit_type": visit_type
+    }
 
-    return df
+    if not all(data.values()):
+        raise BookingError("EXCEL", "Required Fields Missing")
+
+    start = datetime.strptime(data["start_time"], "%H:%M")
+    end = datetime.strptime(data["end_time"], "%H:%M")
+
+    if (end - start).total_seconds() != 900:
+        raise BookingError("EXCEL", "Invalid Time Range")
+
+    data["source_key"] = "|".join([
+        data["national_id"],
+        data["clinic_code"],
+        data["doctor_name"],
+        data["appointment_date"],
+        data["start_time"],
+        data["end_time"]
+    ])
+
+    return data
 
 
 def row_fingerprint(row):
-    values = [
-        as_text(row[column])
-        for column in REQUIRED_COLUMNS
-    ]
+    values = [clean(row[column]) for column in INPUT_COLUMNS]
 
     payload = json.dumps(
-        values,
-        ensure_ascii=False,
-        separators=(",", ":")
+        values, ensure_ascii=False, separators=(",", ":")
     )
 
-    return hashlib.sha256(
-        payload.encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def previous_results():
-    if not STATUS.exists():
+def load_results():
+    if not RESULTS.exists():
         return {}
 
-    with STATUS.open(
-        newline="",
-        encoding="utf-8-sig"
+    with RESULTS.open(
+        "r", newline="", encoding="utf-8-sig"
     ) as file:
+        reader = csv.DictReader(file)
+
+        if not set(OUTPUT_COLUMNS).issubset(reader.fieldnames or []):
+            raise RuntimeError(
+                "Existing booking_results.csv has a different format. "
+                "Keep a backup and use a new results file."
+            )
+
         return {
-            int(record["Excel_Row"]): record
-            for record in csv.DictReader(file)
+            int(item["Excel_Row"]): item
+            for item in reader
         }
 
 
 def save_results(results):
-    temporary = STATUS.with_suffix(".csv.tmp")
+    temporary = RESULTS.with_suffix(".csv.tmp")
 
     with temporary.open(
-        "w",
-        newline="",
-        encoding="utf-8-sig"
+        "w", newline="", encoding="utf-8-sig"
     ) as file:
         writer = csv.DictWriter(
-            file,
-            fieldnames=FIELDS,
-            extrasaction="ignore"
+            file, fieldnames=OUTPUT_COLUMNS
         )
-
         writer.writeheader()
 
-        for key in sorted(results):
-            writer.writerow(results[key])
+        for row_number in sorted(results):
+            writer.writerow(results[row_number])
 
         file.flush()
         os.fsync(file.fileno())
 
-    os.replace(temporary, STATUS)
+    os.replace(temporary, RESULTS)
 
 
-def record_result(results, excel_row, fingerprint,
-                  status, stage, details):
+EXCEL_RESULT_COLUMNS = ("Status", "Error_Reason", "Stage", "Updated_At")
 
+
+def excel_status(booking_status):
+    if booking_status.startswith("Successfully Saved"):
+        return ("Successfully Registered", "")
+    if booking_status in REVIEW_STATUSES:
+        return ("Review Required", booking_status)
+    return ("Failed", booking_status)
+
+
+def sync_results_to_excel(results):
+    """Mirror recorded CSV results to the source workbook, without altering inputs."""
+    if not results:
+        return
+
+    workbook = load_workbook(EXCEL)
+    sheet = workbook.active
+    headers = {
+        str(cell.value): cell.column
+        for cell in sheet[1]
+        if cell.value is not None
+    }
+    for name in EXCEL_RESULT_COLUMNS:
+        if name not in headers:
+            column = sheet.max_column + 1
+            sheet.cell(row=1, column=column, value=name)
+            headers[name] = column
+
+    for row_number, result in results.items():
+        if row_number < 2 or row_number > sheet.max_row:
+            continue
+        status, reason = excel_status(result["Booking_Status"])
+        values = {
+            "Status": status,
+            "Error_Reason": reason if reason else "",
+            "Stage": result["Stage"],
+            "Updated_At": result["Updated_At"],
+        }
+        if result["Booking_Status"] in REVIEW_STATUSES:
+            values["Error_Reason"] = result["Details"]
+        elif status == "Failed":
+            values["Error_Reason"] = result["Details"] or reason
+        elif "OVER BOOKING" in result["Booking_Status"]:
+            values["Status"] = "Successfully Registered - OVER BOOKING"
+        for name, value in values.items():
+            sheet.cell(row=row_number, column=headers[name], value=value)
+
+    temporary = EXCEL.with_name(EXCEL.stem + ".tmp.xlsx")
+    try:
+        workbook.save(temporary)
+        os.replace(temporary, EXCEL)
+    finally:
+        workbook.close()
+        if temporary.exists():
+            temporary.unlink()
+
+
+def record(results, excel_row, fingerprint, status, stage, details):
     results[excel_row] = {
         "Excel_Row": excel_row,
         "Row_Fingerprint": fingerprint,
@@ -245,553 +284,457 @@ def record_result(results, excel_row, fingerprint,
     }
 
     save_results(results)
+    sync_results_to_excel(results)
 
 
-def fill(driver, field, value):
-    element = driver.find_element(By.ID, field)
-    element.clear()
-    element.send_keys(value)
+def api_get(endpoint, params=None):
+    address = URL + endpoint
+
+    if params:
+        address += "?" + urlencode(params)
+
+    with urlopen(address, timeout=WAIT) as response:
+        return json.load(response)
 
 
-def set_and_verify(driver, field, value):
-    element = driver.find_element(By.ID, field)
+def verify_booking(data):
+    response = api_get(
+        "/api/verify",
+        {"source_key": data["source_key"]}
+    )
+    return bool(response.get("found"))
+
+
+def check_slot(data):
+    response = api_get(
+        "/api/slot",
+        {
+            "clinic_code": data["clinic_code"],
+            "doctor_name": data["doctor_name"],
+            "appointment_date": data["appointment_date"],
+            "start_time": data["start_time"]
+        }
+    )
+
+    if not response.get("ok"):
+        message = response.get("message") or "Unknown Error"
+        raise BookingError("SLOT_CHECK", message)
+
+    return response
+
+
+def by_id(driver, name):
+    return driver.find_element(By.ID, name)
+
+
+def field_value(driver, name):
+    return by_id(driver, name).get_attribute("value").strip()
+
+
+def field_text(driver, name):
+    return by_id(driver, name).text.strip()
+
+
+def set_input(driver, name, value):
+    field = by_id(driver, name)
 
     driver.execute_script(
         """
-        arguments[0].value = arguments[1];
-        arguments[0].dispatchEvent(
-            new Event('input', {bubbles: true})
+        const field = arguments[0];
+        const value = arguments[1];
+        const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype, "value"
+        ).set;
+
+        setter.call(field, value);
+
+        field.dispatchEvent(
+            new Event("input", {bubbles: true})
         );
-        arguments[0].dispatchEvent(
-            new Event('change', {bubbles: true})
+
+        field.dispatchEvent(
+            new Event("change", {bubbles: true})
         );
         """,
-        element,
+        field,
         value
     )
 
-    actual = driver.find_element(
-        By.ID, field
-    ).get_attribute("value")
-
-    if actual != value:
-        raise BookingStageError(
-            "VERIFY_DATE_TIME",
-            f"Appointment Date/Time Mismatch: {field}"
+    if field_value(driver, name) != value:
+        raise BookingError(
+            "SET_FIELD",
+            f"Unable to set {name}"
         )
 
 
-def verify_date_time(driver, appointment_date, start, end):
-    expected = {
-        "appointment_date": appointment_date,
-        "start_time": start,
-        "end_time": end
-    }
+def login(driver):
+    driver.get(URL + "/booking")
 
-    for field, value in expected.items():
-        actual = driver.find_element(
-            By.ID, field
-        ).get_attribute("value")
-
-        if actual != value:
-            raise BookingStageError(
-                "VERIFY_DATE_TIME",
-                f"Appointment Date/Time Mismatch: {field}"
-            )
-
-
-def wait_slot_result(driver):
-    def ready(browser):
-        message = browser.find_element(
-            By.ID, "slot_message"
-        ).text.strip()
-
-        recognized = (
-            "available slot",
-            "occupied slot",
-            "overbooking",
-            "schedule not generated",
-            "no slot",
-            "invalid",
-            "error"
-        )
-
-        if any(
-            phrase in message.lower()
-            for phrase in recognized
-        ):
-            return message
-
-        return False
-
-    return WebDriverWait(
-        driver, WAIT_SECONDS
-    ).until(ready)
-
-
-def verify_booking(source_key):
-    query = urlencode({"source_key": source_key})
-
-    endpoint = (
-        "http://127.0.0.1:5000/api/verify?" + query
+    WebDriverWait(driver, WAIT).until(
+        lambda d: by_id(d, "login_button").is_displayed()
     )
 
-    with urlopen(endpoint, timeout=WAIT_SECONDS) as response:
-        data = json.load(response)
+    set_input(driver, "login_username", "demo")
+    set_input(driver, "login_password", "demo")
 
-    return data.get("found", False)
+    by_id(driver, "login_button").click()
+
+    WebDriverWait(driver, WAIT).until(
+        lambda d: by_id(d, "dashboard").is_displayed()
+    )
 
 
-def prepare_row(row):
-    national_id = synthetic_id(row["ID type"])
-    patient = as_text(row["PatientName"])
-    clinic = as_text(row["CLINICCODE"]).upper()
-    doctor = as_text(row["DoctorName"])
+def choose_filters(driver, data):
+    Select(
+        by_id(driver, "clinic_code")
+    ).select_by_value(data["clinic_code"])
 
-    appointment_date = date_text(row["ScheduleDate"])
-    start = time_text(row["StartTime"])
-    end = time_text(row["EndTime"])
-    visit = visit_type(row["IsVirtual"])
+    set_input(
+        driver, "doctor_name", data["doctor_name"]
+    )
 
-    if not patient or not clinic or not doctor:
-        raise ValueError("Missing patient/clinic/doctor")
+    set_input(
+        driver, "appointment_date", data["appointment_date"]
+    )
 
-    if clinic not in ("OPT1", "NS04", "SUBNS04"):
-        raise ValueError("Schedule Not Generated")
+    Select(
+        by_id(driver, "visit_type")
+    ).select_by_value(data["visit_type"])
 
-    if end <= start:
-        raise ValueError("Invalid Appointment Time")
+    if field_value(driver, "clinic_code") != data["clinic_code"]:
+        raise BookingError(
+            "FILTERS", "Clinic selection mismatch"
+        )
 
-    source_key = "|".join([
-        national_id,
-        clinic,
-        doctor,
-        appointment_date,
-        start,
-        end
-    ])
+    if field_value(driver, "doctor_name") != data["doctor_name"]:
+        raise BookingError(
+            "FILTERS", "Care Provider Mismatch"
+        )
 
-    return {
-        "national_id": national_id,
-        "patient": patient,
-        "clinic": clinic,
-        "doctor": doctor,
-        "appointment_date": appointment_date,
-        "start": start,
-        "end": end,
-        "visit": visit,
-        "source_key": source_key
+    if field_value(driver, "appointment_date") != data["appointment_date"]:
+        raise BookingError(
+            "FILTERS", "Appointment Date Mismatch"
+        )
+
+
+def wait_for_calendar(driver, data):
+    selector = (
+        f'button.slot[data-date="{data["appointment_date"]}"]'
+        f'[data-time="{data["start_time"]}"]'
+    )
+
+    def calendar_ready(browser):
+        calendar = by_id(browser, "weekly_calendar")
+
+        if calendar.get_attribute("data-ready") != "true":
+            return False
+
+        if field_value(browser, "clinic_code") != data["clinic_code"]:
+            return False
+
+        if field_value(browser, "doctor_name") != data["doctor_name"]:
+            return False
+
+        if field_value(browser, "appointment_date") != data["appointment_date"]:
+            return False
+
+        matches = browser.find_elements(
+            By.CSS_SELECTOR, selector
+        )
+
+        return matches[0] if matches else False
+
+    try:
+        return WebDriverWait(
+            driver, WAIT
+        ).until(calendar_ready)
+
+    except TimeoutException as exc:
+        raise BookingError(
+            "CALENDAR_LOAD",
+            "Automation Timeout: calendar did not finish loading"
+        ) from exc
+
+
+def open_slot(driver, data):
+    slot = wait_for_calendar(driver, data)
+
+    slot_info = check_slot(data)
+    existing_count = int(slot_info.get("count", 0))
+
+    if not slot.is_enabled():
+        raise BookingError(
+            "SLOT_CHECK",
+            "No available slot"
+        )
+
+    slot.click()
+
+    WebDriverWait(driver, WAIT).until(
+        lambda d: by_id(d, "booking_modal").is_displayed()
+    )
+
+    expected_fields = {
+        "modal_date": data["appointment_date"],
+        "start_time": data["start_time"],
+        "end_time": data["end_time"]
     }
 
-
-def process(driver, row):
-    stage = "VALIDATE_EXCEL"
-
-    try:
-        data = prepare_row(row)
-    except Exception as exc:
-        raise BookingStageError(
-            stage, str(exc)
-        ) from exc
-
-    stage = "OPEN_BOOKING"
-
-    try:
-        driver.get(URL)
-
-        WebDriverWait(
-            driver, WAIT_SECONDS
-        ).until(
-            lambda browser: browser.find_element(
-                By.ID, "clinic_code"
+    for name, expected in expected_fields.items():
+        if field_value(driver, name) != expected:
+            raise BookingError(
+                "MODAL_VERIFY",
+                "Appointment Date/Time Mismatch"
             )
+
+    if existing_count > 0:
+        overbooking = WebDriverWait(driver, WAIT).until(
+            lambda d: by_id(d, "overbook")
+            if by_id(d, "overbook").is_displayed()
+            else False
         )
 
-        Select(
-            driver.find_element(By.ID, "clinic_code")
-        ).select_by_value(data["clinic"])
+        overbooking.click()
 
-        fill(driver, "doctor_name", data["doctor"])
+    return existing_count > 0
 
-    except Exception as exc:
-        raise BookingStageError(
-            stage, str(exc)
-        ) from exc
 
-    stage = "VERIFY_DATE_TIME"
+def lookup_patient(driver, data):
+    set_input(
+        driver, "national_id", data["national_id"]
+    )
 
-    try:
-        for field, value in (
-            ("appointment_date", data["appointment_date"]),
-            ("start_time", data["start"]),
-            ("end_time", data["end"])
-        ):
-            set_and_verify(driver, field, value)
+    def lookup_finished(browser):
+        message = field_text(browser, "patient_message")
+        name = field_value(browser, "patient_name")
+        return message or name or False
 
-        verify_date_time(
-            driver,
-            data["appointment_date"],
-            data["start"],
-            data["end"]
+    WebDriverWait(driver, WAIT).until(lookup_finished)
+
+    message = field_text(driver, "patient_message")
+    patient_name = field_value(driver, "patient_name")
+    mobile = field_value(driver, "mobile")
+
+    if message in KNOWN_ERRORS:
+        raise BookingError("PATIENT_LOOKUP", message)
+
+    if not patient_name:
+        raise BookingError(
+            "PATIENT_LOOKUP",
+            message or "No records found"
         )
 
-    except BookingStageError:
-        raise
-    except Exception as exc:
-        raise BookingStageError(
-            stage, str(exc)
-        ) from exc
-
-    stage = "PATIENT_SEARCH"
-
-    try:
-        fill(driver, "national_id", data["national_id"])
-
-        driver.execute_script(
-            """
-            arguments[0].dispatchEvent(
-                new Event('change', {bubbles: true})
-            );
-            """,
-            driver.find_element(By.ID, "national_id")
+    if patient_name.casefold() != data["patient_name"].casefold():
+        raise BookingError(
+            "PATIENT_LOOKUP",
+            "Patient Name Mismatch"
         )
 
-        WebDriverWait(
-            driver, WAIT_SECONDS
-        ).until(
-            lambda browser:
-                browser.find_element(
-                    By.ID, "patient_name"
-                ).get_attribute("value")
-                or browser.find_element(
-                    By.ID, "patient_message"
-                ).text
+    if len(patient_name.split()) < 3:
+        raise BookingError("PRE_SAVE", "No Third Name")
+
+    if not re.fullmatch(r"\d{10}", mobile):
+        raise BookingError(
+            "PRE_SAVE",
+            "Incomplete Mobile Number"
         )
 
-        actual = driver.find_element(
-            By.ID, "patient_name"
-        ).get_attribute("value").strip()
+    if message != "Patient found.":
+        raise BookingError(
+            "PATIENT_LOOKUP",
+            "Unknown Error: " + message
+        )
 
-        message = driver.find_element(
-            By.ID, "patient_message"
-        ).text.strip()
 
-        if not actual:
-            raise BookingStageError(
-                stage,
-                message or "Patient Not Found"
-            )
+def submit_booking(driver, data, overbooking):
+    save_button = by_id(driver, "save")
 
-        if actual.casefold() != data["patient"].casefold():
-            raise BookingStageError(
-                stage, "Patient Name Mismatch"
-            )
+    if not save_button.is_enabled():
+        raise BookingError(
+            "PRE_SAVE",
+            "Save button is disabled"
+        )
 
-        if len(actual.split()) < 3:
-            raise BookingStageError(
-                stage, "No Third Name"
-            )
-
-        mobile = driver.find_element(
-            By.ID, "mobile"
-        ).get_attribute("value").strip()
-
-        if not re.fullmatch(r"\d{10}", mobile):
-            raise BookingStageError(
-                stage, "Incomplete Mobile Number"
-            )
-
-        if message:
-            raise BookingStageError(
-                stage, message
-            )
-
-    except BookingStageError:
-        raise
-    except Exception as exc:
-        raise BookingStageError(
-            stage, str(exc)
-        ) from exc
-
-    stage = "VISIT_TYPE"
+    save_button.click()
 
     try:
-        Select(
-            driver.find_element(By.ID, "visit_type")
-        ).select_by_visible_text(data["visit"])
-
-    except Exception as exc:
-        raise BookingStageError(
-            stage, "Invalid Visit Type"
-        ) from exc
-
-    stage = "SLOT_CHECK"
-
-    try:
-        driver.find_element(
-            By.ID, "check_slot"
-        ).click()
-
-        message = wait_slot_result(driver)
-        lower = message.lower()
-
-        if "schedule not generated" in lower:
-            raise BookingStageError(
-                stage, "Schedule Not Generated"
-            )
-
-        if "no available slot" in lower or "no slot" in lower:
-            raise BookingStageError(
-                stage, "No available slot"
-            )
-
-        if "occupied slot" in lower:
-            button = driver.find_element(
-                By.ID, "overbook"
-            )
-
-            if not button.is_displayed():
-                raise BookingStageError(
-                    stage,
-                    "Overbooking button not visible"
+        response = WebDriverWait(driver, WAIT).until(
+            lambda d: (
+                field_text(d, "result")
+                if field_text(d, "result")
+                and field_text(d, "result")
+                not in (
+                    "Saving appointment...",
+                    "Overbooking approved for this slot."
                 )
-
-            button.click()
-
-            WebDriverWait(
-                driver, WAIT_SECONDS
-            ).until(
-                lambda browser:
-                    "approved" in browser.find_element(
-                        By.ID, "slot_message"
-                    ).text.lower()
+                else False
             )
+        )
 
-        elif "available slot" not in lower:
-            raise BookingStageError(
-                stage,
-                "Unexpected slot result"
-            )
-
-    except BookingStageError:
-        raise
-    except Exception as exc:
-        raise BookingStageError(
-            stage, str(exc)
+    except TimeoutException as exc:
+        raise BookingError(
+            "POST_SAVE",
+            "Save Status Uncertain: response timeout"
         ) from exc
 
-    stage = "PRE_SAVE"
+    if response.startswith("Successfully Saved"):
+        try:
+            confirmed = verify_booking(data)
+        except Exception as exc:
+            raise BookingError(
+                "VERIFY_SAVE",
+                "Save Status Uncertain: verification failed"
+            ) from exc
 
+        if not confirmed:
+            raise BookingError(
+                "VERIFY_SAVE",
+                "Save Status Uncertain: booking not found"
+            )
+
+        status = (
+            "Successfully Saved — OVER BOOKING"
+            if overbooking
+            else "Successfully Saved"
+        )
+
+        return status, "VERIFY_SAVE", "Booking verified in mock database"
+
+    if response in KNOWN_ERRORS:
+        raise BookingError("POST_SAVE", response)
+
+    raise BookingError(
+        "POST_SAVE",
+        "Unknown Error: " + response
+    )
+
+
+def process_booking(driver, data):
     try:
-        verify_date_time(
-            driver,
-            data["appointment_date"],
-            data["start"],
-            data["end"]
-        )
-
-        save_button = driver.find_element(
-            By.ID, "save"
-        )
-
-        if not save_button.is_enabled():
-            raise BookingStageError(
-                stage, "Save Button Disabled"
+        if verify_booking(data):
+            return (
+                "Appointment Already Exists",
+                "DUPLICATE_CHECK",
+                "Existing booking found in mock database"
             )
-
-    except BookingStageError:
-        raise
     except Exception as exc:
-        raise BookingStageError(
-            stage, str(exc)
+        raise BookingError(
+            "DUPLICATE_CHECK",
+            "Unable to verify existing bookings"
         ) from exc
 
-    stage = "SAVE_CLICK"
+    login(driver)
+    choose_filters(driver, data)
 
-    try:
-        driver.execute_script(
-            "document.getElementById('result').textContent = '';"
-        )
+    overbooking = open_slot(driver, data)
+    lookup_patient(driver, data)
 
-        save_button.click()
-
-        stage = "POST_SAVE"
-
-        result = WebDriverWait(
-            driver, WAIT_SECONDS
-        ).until(
-            lambda browser:
-                browser.find_element(
-                    By.ID, "result"
-                ).text.strip() or False
-        )
-
-        if not result.startswith("Successfully Saved"):
-            if result in KNOWN_ERRORS:
-                raise BookingStageError(
-                    stage, result
-                )
-
-            raise BookingStageError(
-                stage,
-                "Save Status Uncertain: " + result
-            )
-
-        stage = "VERIFY_BOOKING"
-
-        if not verify_booking(data["source_key"]):
-            raise BookingStageError(
-                stage,
-                "Save Status Uncertain: booking not verified"
-            )
-
-        return (
-            "Successfully Saved",
-            stage,
-            "Verified using the mock booking API"
-        )
-
-    except BookingStageError:
-        raise
-
-    except Exception as exc:
-        raise BookingStageError(
-            stage,
-            "Save Status Uncertain"
-        ) from exc
-
+    return submit_booking(driver, data, overbooking)
 
 def classify_error(exc):
-    details = str(exc).strip() or type(exc).__name__
     stage = getattr(exc, "stage", "UNKNOWN")
+    message = str(exc).strip() or type(exc).__name__
 
-    if "Appointment Date/Time Mismatch" in details:
-        return (
-            "Appointment Date Mismatch",
-            stage,
-            details
-        )
+    if message in KNOWN_ERRORS:
+        return message, stage, message
 
-    if stage in (
-        "SAVE_CLICK",
-        "POST_SAVE",
-        "VERIFY_BOOKING"
-    ):
-        if details in KNOWN_ERRORS:
-            return details, stage, details
+    if stage in ("POST_SAVE", "VERIFY_SAVE", "SAVE_CLICK"):
+        return "Save Status Uncertain", stage, message
 
-        return (
-            "Save Status Uncertain",
-            stage,
-            details
-        )
+    if isinstance(exc, TimeoutException) or "Timeout" in message:
+        return "Automation Timeout", stage, message
 
-    if details in KNOWN_ERRORS:
-        return details, stage, details
+    if message.startswith("Unknown Error:"):
+        return "Unknown Error", stage, message
 
-    if isinstance(
-        exc, (TimeoutException, WebDriverException)
-    ):
-        return (
-            "Automation Error",
-            stage,
-            details
-        )
-
-    return (
-        "Failed: " + details[:160],
-        stage,
-        details
-    )
+    return "Automation Error", stage, message
 
 
 def main():
-    parsed = urlparse(URL)
-
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname not in ("127.0.0.1", "localhost")
-        or parsed.port != 5000
-        or parsed.path != "/booking"
-    ):
-        raise RuntimeError(
-            "Refusing non-local mock URL"
+    if not EXCEL.exists():
+        raise FileNotFoundError(
+            "patients_appointments.xlsx not found"
         )
 
-    df = load_rows()
-    results = previous_results()
+    dataframe = pd.read_excel(
+        EXCEL,
+        dtype=str,
+        keep_default_na=False
+    )
+
+    missing = [
+        column for column in INPUT_COLUMNS
+        if column not in dataframe.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Missing Excel columns: " + ", ".join(missing)
+        )
+
+    results = load_results()
+    sync_results_to_excel(results)  # Fill Excel with prior run results as well.
 
     driver = webdriver.Chrome()
 
     try:
-        driver.set_page_load_timeout(20)
+        driver.set_page_load_timeout(WAIT)
 
-        for index, row in df.iterrows():
+        for index, row in dataframe.iterrows():
             excel_row = index + 2
             fingerprint = row_fingerprint(row)
-            old = results.get(excel_row, {})
 
-            if old:
-                old_fingerprint = old.get(
-                    "Row_Fingerprint", ""
+            previous = results.get(excel_row)
+
+            if previous:
+                previous_hash = previous["Row_Fingerprint"]
+                previous_status = previous["Booking_Status"]
+
+                if previous_hash != fingerprint:
+                    print(
+                        f"Row {excel_row}: REVIEW REQUIRED - "
+                        "Excel row changed; old result preserved"
+                    )
+                    continue
+
+                if previous_status in REVIEW_STATUSES:
+                    print(
+                        f"Row {excel_row}: REVIEW REQUIRED - "
+                        "check mock database before retrying"
+                    )
+                    continue
+
+                print(
+                    f"Row {excel_row}: SKIPPED - "
+                    f"already processed ({previous_status})"
                 )
+                continue
 
-                if not old_fingerprint:
-                    print(
-                        f"Row {excel_row}: legacy result "
-                        "requires manual review"
-                    )
-                    continue
-
-                if old_fingerprint != fingerprint:
-                    record_result(
-                        results,
-                        excel_row,
-                        fingerprint,
-                        "Review Required - Input Changed",
-                        "RESUME_CHECK",
-                        "Excel row changed since previous run"
-                    )
-                    print(
-                        f"Row {excel_row}: input changed, "
-                        "manual review required"
-                    )
-                    continue
-
-                if old.get("Booking_Status") in SKIP_STATUSES:
-                    print(
-                        f"Row {excel_row}: skipped "
-                        f"({old['Booking_Status']})"
-                    )
-                    continue
-
-            record_result(
+            record(
                 results,
                 excel_row,
                 fingerprint,
-                "In Progress - Review Before Retry",
+                "In Progress",
                 "START",
-                "Processing started"
+                "Row processing started"
             )
 
             try:
-                status, stage, details = process(
-                    driver, row
+                data = prepare(row)
+
+                status, stage, details = process_booking(
+                    driver, data
                 )
 
             except Exception as exc:
-                status, stage, details = classify_error(
-                    exc
-                )
+                status, stage, details = classify_error(exc)
 
                 logging.exception(
-                    "Row=%s stage=%s error=%s",
-                    excel_row,
-                    stage,
-                    details
+                    "Excel_Row=%s | Stage=%s | Status=%s | Details=%s",
+                    excel_row, stage, status, details
                 )
 
-            record_result(
+            record(
                 results,
                 excel_row,
                 fingerprint,
@@ -801,7 +744,8 @@ def main():
             )
 
             print(
-                f"Row {excel_row}: {status}"
+                f"Excel Row {excel_row}: "
+                f"{status} | Stage: {stage}"
             )
 
     finally:
